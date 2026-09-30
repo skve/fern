@@ -24,6 +24,11 @@ export interface LoadedSdkConfigV1 {
     payload: FernSdkConfigV1Payload;
 }
 
+interface SdkConfigGenerateFullProjectSettings {
+    root: boolean | undefined;
+    targets: Array<boolean | undefined>;
+}
+
 export interface SdkConfigGeneratorSelection {
     generatorName?: string;
     generatorIndex?: number;
@@ -52,8 +57,15 @@ export async function loadSdkConfigV1(
     }
 
     try {
-        const { sanitizedInput, credentials } = sanitizeSdkConfigPublishCredentials(input, isPreview);
-        const { document, parsed } = validateAndParseSdkConfigV1(sanitizedInput);
+        const generateFullProjectSettings = extractGenerateFullProjectSettings(input);
+        const inputForCurrentSdkConfigPackage = stripGenerateFullProjectForCurrentSdkConfigPackage(input);
+        const { sanitizedInput, credentials } = sanitizeSdkConfigPublishCredentials(
+            inputForCurrentSdkConfigPackage,
+            isPreview
+        );
+        const validated = validateAndParseSdkConfigV1(sanitizedInput);
+        const document = applyGenerateFullProjectSettings(validated.document, generateFullProjectSettings);
+        const parsed = applyGenerateFullProjectSettings(validated.parsed, generateFullProjectSettings);
         if (document.targets.length !== credentials.length || parsed.targets.length !== credentials.length) {
             throw new Error("SDK Config v1 target count changed during validation");
         }
@@ -68,6 +80,7 @@ export async function loadSdkConfigV1(
             sdkName: parsed.sdkName,
             sdkVersion: parsed.sdkVersion,
             ...(parsed.apiVersion != null ? { apiVersion: parsed.apiVersion } : {}),
+            generateFullProject: resolveGenerateFullProject(generateFullProjectSettings, undefined),
             ...(parsed.api.audiences != null ? { audiences: parsed.api.audiences } : {}),
             ...(parsed.client.pathParameterStyle != null
                 ? { clientPathParameterStyle: parsed.client.pathParameterStyle }
@@ -86,6 +99,7 @@ export async function loadSdkConfigV1(
                 return {
                     body: Buffer.from(`${JSON.stringify({ ...document, targets: [documentTarget] })}\n`),
                     language: target.language,
+                    generateFullProject: resolveGenerateFullProject(generateFullProjectSettings, index),
                     ...(target.generatorVersion != null ? { generatorVersion: target.generatorVersion } : {}),
                     ...(target.sdkName != null ? { sdkName: target.sdkName } : {}),
                     ...(target.sdkVersion != null ? { sdkVersion: target.sdkVersion } : {}),
@@ -186,6 +200,100 @@ function getTargetIndexes(config: SdkConfigV1, targetNames: string[] | undefined
         );
     }
     return config.targets.flatMap((target, index) => (requested.includes(target.language) ? [index] : []));
+}
+
+function extractGenerateFullProjectSettings(input: unknown): SdkConfigGenerateFullProjectSettings {
+    if (!isRecord(input)) {
+        return { root: undefined, targets: [] };
+    }
+    const root = readOptionalBoolean(input.generation, "generation.generateFullProject");
+    const targets = Array.isArray(input.targets)
+        ? input.targets.map((target, index) =>
+              isRecord(target)
+                  ? readOptionalBoolean(target.generation, `targets[${index}].generation.generateFullProject`)
+                  : undefined
+          )
+        : [];
+    return { root, targets };
+}
+
+/**
+ * TODO: remove this compatibility shim once @postman/sdk-config with
+ * generation.generateFullProject is published and this repo's catalog points at it.
+ */
+function stripGenerateFullProjectForCurrentSdkConfigPackage(input: unknown): unknown {
+    if (!isRecord(input)) {
+        return input;
+    }
+    return {
+        ...input,
+        generation: stripGenerateFullProjectFromGeneration(input.generation),
+        ...(Array.isArray(input.targets)
+            ? {
+                  targets: input.targets.map((target) =>
+                      isRecord(target)
+                          ? { ...target, generation: stripGenerateFullProjectFromGeneration(target.generation) }
+                          : target
+                  )
+              }
+            : {})
+    };
+}
+
+function stripGenerateFullProjectFromGeneration(generation: unknown): unknown {
+    if (!isRecord(generation)) {
+        return generation;
+    }
+    const { generateFullProject: _generateFullProject, ...rest } = generation;
+    return rest;
+}
+
+function readOptionalBoolean(value: unknown, path: string): boolean | undefined {
+    if (!isRecord(value)) {
+        return undefined;
+    }
+    const candidate = value.generateFullProject;
+    if (candidate == null) {
+        return undefined;
+    }
+    if (typeof candidate !== "boolean") {
+        throw new Error(`${path} must be a boolean`);
+    }
+    return candidate;
+}
+
+function resolveGenerateFullProject(
+    settings: SdkConfigGenerateFullProjectSettings,
+    targetIndex: number | undefined
+): boolean {
+    if (targetIndex != null) {
+        return settings.targets[targetIndex] ?? settings.root ?? false;
+    }
+    return settings.root ?? false;
+}
+
+function applyGenerateFullProjectSettings<T extends { generation?: unknown; targets: Array<{ generation?: unknown }> }>(
+    config: T,
+    settings: SdkConfigGenerateFullProjectSettings
+): T {
+    const generation = isRecord(config.generation) ? config.generation : {};
+    return {
+        ...config,
+        generation: {
+            ...generation,
+            generateFullProject: resolveGenerateFullProject(settings, undefined)
+        },
+        targets: config.targets.map((target, index) => {
+            const targetGeneration = isRecord(target.generation) ? target.generation : {};
+            return {
+                ...target,
+                generation: {
+                    ...targetGeneration,
+                    generateFullProject: resolveGenerateFullProject(settings, index)
+                }
+            };
+        })
+    } as T;
 }
 
 function validateAndParseSdkConfigV1(input: unknown): {
